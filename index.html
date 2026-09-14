@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>엽록소는 왜 초록색이어야 해?</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css" />
+<style>
+  :root {
+    --bg: #ffffff;
+    --ink: #1d1d1b;
+    --muted: #7a776f;
+    --tile: #ffffff;
+    --line: #e6e6e3;
+    --accent: #3f8f4a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Pretendard Variable", "Pretendard", -apple-system, "Apple SD Gothic Neo", system-ui, sans-serif;
+    padding-inline: clamp(16px, 4vw, 56px);
+    padding-block: 48px 80px;
+  }
+  header { text-align: center; }
+  h1 {
+    font-size: 18px;
+    letter-spacing: -0.01em;
+    line-height: 1.2;
+    margin: 0;
+    font-weight: 500;
+  }
+  h1 .q { color: var(--accent); transition: color .3s; }
+
+  .controls {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 14px 24px;
+    margin: 36px 0 28px; padding-block: 14px;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+  }
+  .field { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+  .field input[type="range"] { width: 140px; accent-color: var(--ink); }
+  #hue { background: linear-gradient(90deg, red, #ff0, lime, cyan, blue, #f0f, red); border-radius: 4px; height: 6px; appearance: none; }
+  #hue::-webkit-slider-thumb { appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #fff; border: 2px solid var(--ink); }
+  label.toggle { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); cursor: pointer; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 14px;
+  }
+  @media (max-width: 900px) { .grid { grid-template-columns: repeat(4, 1fr); } }
+  figure { margin: 0; }
+  .tile {
+    position: relative; aspect-ratio: 1; background: var(--tile);
+    overflow: hidden;
+  }
+  .tile canvas, .tile img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; padding: 8%;
+  }
+  .tile img { opacity: 0; transition: opacity .25s; }
+  .tile:hover img { opacity: 1; }
+  .err { color: #b33; font-size: 14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>엽록소는 왜 <span class="q">초록색</span>이어야 해?</h1>
+</header>
+
+<div class="controls">
+  <div class="field">hue <input id="hue" type="range" min="0" max="360" value="330" /></div>
+  <div class="field">채도 <input id="boost" type="range" min="0.5" max="2.5" step="0.05" value="1.3" /></div>
+  <div class="field">인식 범위 <input id="spread" type="range" min="0" max="1" step="0.05" value="0.7" /></div>
+  <label class="toggle"><input id="maskToggle" type="checkbox" /> 마스크 보기</label>
+</div>
+
+<main class="grid" id="grid"></main>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 p;
+varying vec2 uv;
+void main() {
+  uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+  gl_Position = vec4(p, 0.0, 1.0);
+}
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+varying vec2 uv;
+uniform sampler2D tex;
+uniform float targetHue;  // LCh hue (deg) of the target color
+uniform float boost;      // chroma multiplier
+uniform float spread;     // 0~1 green detection range
+uniform int mode;         // 0 original, 1 recolor, 2 mask
+
+const float GREEN_CENTER = 150.0;
+const vec3 WP = vec3(0.95047, 1.0, 1.08883);
+
+vec3 toLinear(vec3 c) {
+  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
+}
+vec3 toSrgb(vec3 c) {
+  return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+// GLSL mat3 is column-major: these are the transposed sRGB<->XYZ matrices
+const mat3 RGB2XYZ = mat3(0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505);
+const mat3 XYZ2RGB = mat3(3.2406, -0.9689, 0.0557, -1.5372, 1.8758, -0.2040, -0.4986, 0.0415, 1.0570);
+
+float fLab(float t) { return t > 0.008856 ? pow(t, 1.0 / 3.0) : (7.787 * t + 16.0 / 116.0); }
+float fInv(float t) { return t * t * t > 0.008856 ? t * t * t : (t - 16.0 / 116.0) / 7.787; }
+
+vec3 rgb2lab(vec3 c) {
+  vec3 xyz = RGB2XYZ * toLinear(c) / WP;
+  vec3 f = vec3(fLab(xyz.x), fLab(xyz.y), fLab(xyz.z));
+  return vec3(116.0 * f.y - 16.0, 500.0 * (f.x - f.y), 200.0 * (f.y - f.z));
+}
+vec3 lab2rgb(vec3 lab) {
+  float fy = (lab.x + 16.0) / 116.0;
+  vec3 xyz = vec3(fInv(fy + lab.y / 500.0), fInv(fy), fInv(fy - lab.z / 200.0)) * WP;
+  return toSrgb(clamp(XYZ2RGB * xyz, 0.0, 1.0));
+}
+
+void main() {
+  vec4 src = texture2D(tex, uv);
+  if (mode == 0) { gl_FragColor = src; return; }
+
+  vec3 lab = rgb2lab(src.rgb);
+  float C = length(lab.yz);
+  float H = mod(degrees(atan(lab.z, lab.y)) + 360.0, 360.0);
+
+  // 비대칭 hue 윈도우: 노랑(~100-110°) 쪽은 좁게, 청록 쪽은 넓게. 무채색은 제외
+  // spread가 클수록 hue 범위가 넓어지고, 옅은/그림자 초록(저채도)까지 잡힘
+  // 노랑 쪽 경계: 밝은 노랑(L~90, 모다피 머리)은 보호하고,
+  // 어두운 올리브(L~40, 헐크 피부)는 hue가 노랑에 가까워도 초록으로 인정
+  float yLoBright = 107.0 - 12.0 * smoothstep(0.75, 1.0, spread);
+  float yLoDark = 94.0 - 10.0 * spread;
+  float darkness = 1.0 - smoothstep(58.0, 78.0, lab.x);
+  float yLo = mix(yLoBright, yLoDark, darkness);
+  float cHi = 205.0 + 35.0 * spread;
+  float c0 = mix(5.0, 0.5, spread);
+  float c1 = mix(12.0, 2.5, spread);
+  float w = smoothstep(yLo, yLo + 10.0, H) * (1.0 - smoothstep(cHi, cHi + 25.0, H)) * smoothstep(c0, c1, C);
+
+  if (mode == 2) { gl_FragColor = vec4(vec3(w), src.a); return; }
+
+  // 원래 초록 안의 hue 차이는 35%만 남김 — 올리브(~95°)가 목표 색에서 너무 멀어지지 않게
+  float nh = radians(targetHue + (H - GREEN_CENTER) * 0.35);
+  float nc = C * boost;
+  vec3 outc = lab2rgb(vec3(lab.x, nc * cos(nh), nc * sin(nh)));
+  gl_FragColor = vec4(mix(src.rgb, outc, w), src.a);
+}
+</script>
+
+<script>
+// ---- color utils (JS side, 목표 색의 LCh hue 계산용) ----
+function hexToRgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+}
+function hsvToHex(h) {
+  const f = (n) => { const k = (n + h / 60) % 6; return 1 - Math.max(0, Math.min(k, 4 - k, 1)); };
+  return "#" + [f(5), f(3), f(1)].map((v) => Math.round(v * 255).toString(16).padStart(2, "0")).join("");
+}
+function lchHue([r, g, b]) {
+  const lin = (c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+  const [R, G, B] = [lin(r), lin(g), lin(b)];
+  const X = (0.4124 * R + 0.3576 * G + 0.1805 * B) / 0.95047;
+  const Y = 0.2126 * R + 0.7152 * G + 0.0722 * B;
+  const Z = (0.0193 * R + 0.1192 * G + 0.9505 * B) / 1.08883;
+  const f = (t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  const a = 500 * (f(X) - f(Y)), bb = 200 * (f(Y) - f(Z));
+  return ((Math.atan2(bb, a) * 180) / Math.PI + 360) % 360;
+}
+
+// ---- WebGL: 오프스크린 컨텍스트 하나로 모든 이미지를 처리 ----
+// (브라우저의 WebGL 컨텍스트 개수 제한을 피하려고 결과를 각 2D 캔버스로 복사)
+const glCanvas = document.createElement("canvas");
+const gl = glCanvas.getContext("webgl", { premultipliedAlpha: false, preserveDrawingBuffer: true });
+
+function compile(type, id) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, document.getElementById(id).textContent);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, "vs"));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, "fs"));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, "p");
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const U = {
+  targetHue: gl.getUniformLocation(prog, "targetHue"),
+  boost: gl.getUniformLocation(prog, "boost"),
+  mode: gl.getUniformLocation(prog, "mode"),
+  spread: gl.getUniformLocation(prog, "spread"),
+};
+
+const state = { color: hsvToHex(+document.getElementById("hue").value),boost: 1.3, spread: 0.7, mask: false };
+const items = [];
+
+function makeTexture(img) {
+  const t = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+  return t;
+}
+
+function renderAll() {
+  const mode = state.mask ? 2 : state.color ? 1 : 0;
+  gl.uniform1i(U.mode, mode);
+  gl.uniform1f(U.boost, state.boost);
+  gl.uniform1f(U.spread, state.spread);
+  if (state.color) gl.uniform1f(U.targetHue, lchHue(hexToRgb(state.color)));
+  document.querySelector("h1 .q").style.color = state.color || "";
+
+  for (const it of items) {
+    const { img, tex, canvas, ctx } = it;
+    glCanvas.width = canvas.width = img.naturalWidth;
+    glCanvas.height = canvas.height = img.naturalHeight;
+    gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(glCanvas, 0, 0);
+  }
+}
+
+// ---- UI ----
+document.getElementById("hue").oninput = (e) => {
+  state.color = hsvToHex(+e.target.value);
+  renderAll();
+};
+document.getElementById("boost").oninput = (e) => { state.boost = +e.target.value; renderAll(); };
+document.getElementById("spread").oninput = (e) => { state.spread = +e.target.value; renderAll(); };
+document.getElementById("maskToggle").onchange = (e) => { state.mask = e.target.checked; renderAll(); };
+
+// ---- load ----
+// 개발 서버(node server.mjs)면 /api/images로 폴더를 직접 읽고, 아니면 images.json으로 fallback
+async function fetchList() {
+  try {
+    const r = await fetch("/api/images", { cache: "no-store" });
+    if (r.ok) return await r.json();
+  } catch {}
+  return (await fetch("images.json", { cache: "no-store" })).json();
+}
+
+function loadItem({ file, caption, v }) {
+  // 파일명+수정시각이 같으면 기존 것을 재사용
+  const key = `${file}?v=${v ?? ""}`;
+  const cached = items.find((it) => it.key === key);
+  if (cached) {
+    cached.fig.querySelector("img").alt = caption;
+    return Promise.resolve(cached);
+  }
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const fig = document.createElement("figure");
+      const tile = document.createElement("div");
+      tile.className = "tile";
+      const canvas = document.createElement("canvas");
+      const orig = img.cloneNode();
+      orig.alt = caption;
+      tile.append(canvas, orig);
+      fig.append(tile);
+      resolve({ key, file, img, fig, canvas, ctx: canvas.getContext("2d"), tex: makeTexture(img) });
+    };
+    img.onerror = () => { console.warn("failed:", file); resolve(null); };
+    img.src = `images/${encodeURIComponent(file)}${v ? `?v=${v}` : ""}`;
+  });
+}
+
+async function refresh() {
+  const list = await fetchList();
+  const next = (await Promise.all(list.map(loadItem))).filter(Boolean);
+  // 목록에서 빠지거나 교체된 텍스처 정리
+  for (const it of items) if (!next.includes(it)) gl.deleteTexture(it.tex);
+  items.length = 0;
+  items.push(...next);
+  document.getElementById("grid").replaceChildren(...items.map((it) => it.fig));
+  renderAll();
+}
+
+async function main() {
+  await refresh();
+  if (location.protocol.startsWith("http")) {
+    const es = new EventSource("/events");
+    es.onmessage = () => refresh().catch(console.error);
+    es.onerror = () => {}; // 정적 서버면 /events가 없음 — 무시
+  }
+}
+
+main().catch((e) => {
+  document.getElementById("grid").innerHTML =
+    `<p class="err">로드 실패: ${e.message}<br>file:// 로 열면 안 돼요. <code>npx serve .</code> 로 띄워주세요.</p>`;
+  console.error(e);
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "name": "chloroplast",
+  "private": true,
+  "type": "module",
+  "description": "엽록소는 왜 초록색이어야 해? — 세상의 초록만 골라 다른 색으로 바꿔보는 이미지 그리드",
+  "scripts": {
+    "dev": "node server.mjs",
+    "dev:desktop": "IMAGES_DIR=\"$HOME/Desktop/green stuff\" node server.mjs",
+    "gen": "node scripts/gen-list.mjs"
+  }
+}
